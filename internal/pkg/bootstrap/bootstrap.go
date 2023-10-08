@@ -42,8 +42,8 @@ const (
 	// Proxyname is the name of the RE proxy process.
 	Proxyname = "reproxy"
 
-	// oeFile is the file where stdout and stderr of reproxy are redirected.
-	oeFile = "reproxy_outerr.log"
+	// OEFile is the file where stdout and stderr of reproxy are redirected.
+	OEFile = "reproxy_outerr.log"
 
 	// The initial dial timeout seconds when checking whether reproxy is alive or not.
 	initialDialTimeout = 3
@@ -138,7 +138,7 @@ func StartProxy(ctx context.Context, serverAddr, proxyPath string, waitSeconds, 
 // StartProxyWithOutput starts the proxy; if the proxy is already running, it is shut down first.
 // Redirects stdout and stderr to file under given output directory.
 func StartProxyWithOutput(ctx context.Context, serverAddr, proxyPath, outputDir string, waitSeconds, shutdownSeconds int, startTime time.Time, args ...string) error {
-	logFilename := filepath.Join(outputDir, oeFile)
+	logFilename := filepath.Join(outputDir, OEFile)
 	logFile, err := os.Create(logFilename)
 	if err != nil {
 		log.Errorf("Failed to create log file %s: %v", logFilename, err)

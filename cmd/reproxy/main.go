@@ -101,11 +101,11 @@ var (
 	idleTimeout           = flag.Duration("proxy_idle_timeout", 6*time.Hour, "Inactivity period after which the running reproxy process will be killed. Default is 6 hours. When set to 0, idle timeout is disabled.")
 	depsCacheMaxMb        = flag.Int("deps_cache_max_mb", 128, "Maximum size of the deps cache file (for goma input processor only).")
 	// TODO(b/233275188): remove this flag.
-	_                = flag.Duration("ip_reset_min_delay", 3*time.Minute, "Deprecated. The minimum time after the input processor has been reset before it can be reset again. Negative values disable resetting.")
-	ipTimeout        = flag.Duration("ip_timeout", 10*time.Minute, "The maximum time to wait for an input processor action. Zero and negative values disable timeout.")
-	metricsProject   = flag.String("metrics_project", "", "If set, action and build metrics are exported to Cloud Monitoring in the specified GCP project")
-	metricsPrefix    = flag.String("metrics_prefix", "", "Prefix of metrics exported to Cloud Monitoring")
-	metricsNamespace = flag.String("metrics_namespace", "", "Namespace of metrics exported to Cloud Monitoring (e.g. RBE project)")
+	_                         = flag.Duration("ip_reset_min_delay", 3*time.Minute, "Deprecated. The minimum time after the input processor has been reset before it can be reset again. Negative values disable resetting.")
+	ipTimeout                 = flag.Duration("ip_timeout", 10*time.Minute, "The maximum time to wait for an input processor action. Zero and negative values disable timeout.")
+	metricsProject            = flag.String("metrics_project", "", "If set, action and build metrics are exported to Cloud Monitoring in the specified GCP project")
+	metricsPrefix             = flag.String("metrics_prefix", "", "Prefix of metrics exported to Cloud Monitoring")
+	metricsNamespace          = flag.String("metrics_namespace", "", "Namespace of metrics exported to Cloud Monitoring (e.g. RBE project)")
 	failEarlyMinActionCount   = flag.Int64("fail_early_min_action_count", 0, "Minimum number of actions received by reproxy before the fail early mechanism can take effect. 0 indicates fail early is disabled.")
 	failEarlyMinFallbackRatio = flag.Float64("fail_early_min_fallback_ratio", 0, "Minimum ratio of fallbacks to total actions above which the build terminates early. Ratio is a number in the range [0,1]. 0 indicates fail early is disabled.")
 	failEarlyWindow           = flag.Duration("fail_early_window", 0, "Window of time to consider for fail_early_min_action_count and fail_early_min_fallback_ratio. 0 indicates all datapoints should be used.")
@@ -122,7 +122,7 @@ var (
 
 	cppLinkDeepScan = flag.Bool("clang_depscan_archive", false, "Deep scan .a files for dependencies during clang linking")
 
-	depsScannerAddress = flag.String("depsscanner_address", "execrel://", "If set, connects to the given address for C++ dependency scanning; a path with the prefix 'exec://' will start the target executable and connect to it. Defaults to execrel:// which looks for the `scandeps_server` binary in the same folder as reproxy. When set to \"\", the internal dependency scanner will be used.")
+	depsScannerAddress = flag.String("depsscanner_address", "", "If set, connects to the given address for C++ dependency scanning; a path with the prefix 'exec://' will start the target executable and connect to it. Defaults to execrel:// which looks for the `scandeps_server` binary in the same folder as reproxy. When set to \"\", the internal dependency scanner will be used.")
 
 	credsFile          = flag.String("creds_file", "", "Path to file where short-lived credentials are stored. If the file includes a token, reproxy will update the token if it refreshes it. Token refresh is only applicable if use_external_auth_token is used.")
 	waitForShutdownRPC = flag.Bool("wait_for_shutdown_rpc", false, "If set, will only shutdown after 3 SIGINT signals")
@@ -293,6 +293,7 @@ Use this flag if you're using custom llvm build as your toolchain and your llvm 
 
 	initCtx, cancelInit := context.WithCancel(ctx)
 	server := &reproxy.Server{
+		Address:                   *serverAddr,
 		FileMetadataStore:         st,
 		LocalPool:                 reproxy.NewLocalPool(exec, resMgr),
 		KeepLastRecords:           *keepRecords,

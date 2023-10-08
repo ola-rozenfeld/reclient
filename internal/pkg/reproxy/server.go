@@ -17,6 +17,7 @@ package reproxy
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"math/rand"
 	"os"
@@ -35,15 +36,18 @@ import (
 	"github.com/bazelbuild/reclient/internal/pkg/logger"
 	"github.com/bazelbuild/reclient/internal/pkg/logger/event"
 	"github.com/bazelbuild/reclient/internal/pkg/protoencoding"
+	"github.com/bazelbuild/reclient/internal/pkg/reproxystatus"
 	"github.com/bazelbuild/reclient/pkg/inputprocessor"
 	"github.com/bazelbuild/reclient/pkg/version"
 
+	"github.com/bazelbuild/remote-apis-sdks/go/pkg/client"
 	"github.com/bazelbuild/remote-apis-sdks/go/pkg/command"
 	"github.com/bazelbuild/remote-apis-sdks/go/pkg/digest"
 	"github.com/bazelbuild/remote-apis-sdks/go/pkg/filemetadata"
 	"github.com/bazelbuild/remote-apis-sdks/go/pkg/outerr"
 	"github.com/bazelbuild/remote-apis-sdks/go/pkg/rexec"
 	"github.com/bazelbuild/remote-apis-sdks/go/pkg/uploadinfo"
+	"github.com/fatih/color"
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -90,6 +94,8 @@ var (
 
 // Server is the server responsible for executing and retrieving results of RunRequests.
 type Server struct {
+	// hack: is there another way to get it?
+	Address                   string
 	InputProcessor            *inputprocessor.InputProcessor
 	FileMetadataStore         filemetadata.Cache
 	REClient                  *rexec.Client
@@ -129,6 +135,9 @@ type Server struct {
 	startErr                  error
 	cleanupFns                []func()
 	smu                       sync.Mutex
+	bes                       *client.BuildEventStream
+	besProgressTicker         *time.Ticker
+	besProgressDone           chan bool
 }
 
 type ctxWithCause struct {
@@ -139,6 +148,8 @@ type ctxWithCause struct {
 var (
 	// A UUID of this proxy.
 	invocationID = uuid.New().String()
+	// Only used for BES.
+	buildID = uuid.New().String()
 )
 
 func (c ctxWithCause) Err() error {
@@ -193,8 +204,105 @@ func (s *Server) SetREClient(rclient *rexec.Client, cleanup func()) {
 		return
 	}
 	s.REClient = rclient
+	if err := s.maybeStartBuildBES(); err != nil {
+		s.startErr = err
+		cleanup()
+		return
+	}
 	s.cleanupFns = append(s.cleanupFns, cleanup)
 	s.maybeUnblockStartup()
+}
+
+// Dirty hack!
+func getBuildTargets() []string {
+	if ts, ok := os.LookupEnv("NINJA_BUILD_TARGETS"); ok {
+		var result []string
+		for _, t := range strings.Fields(ts) {
+			result = append(result, "//:"+t)
+		}
+		return result
+	}
+	return []string{"//:all"}
+}
+
+func (s *Server) maybeStartBuildBES() (err error) {
+	grpcClient := s.REClient.GrpcClient
+	if grpcClient == nil || grpcClient.BESConnection == nil {
+		return nil
+	}
+	options := make(map[string]string)
+	flag.VisitAll(func(f *flag.Flag) {
+		options[f.Name] = f.Value.String()
+	})
+	meta := &client.BuildMetadata{
+		BuildID:      buildID,
+		InvocationID: invocationID,
+		Targets:      getBuildTargets(),
+		ToolName:     "re-client",
+		ToolVersion:  version.CurrentVersion(),
+		Options:      options,
+	}
+	log.Infof("Streaming build results to: https://%s/invocation/%s\n", grpcClient.BESConnection.Target(), meta.InvocationID)
+	fmt.Printf("Streaming build results to: https://%s/invocation/%s\n", grpcClient.BESConnection.Target(), meta.InvocationID)
+	if s.bes, err = grpcClient.NewBuildEventStream(context.Background(), meta); err != nil {
+		log.Errorf("error connecting to BES service: %v", err)
+		return err
+	}
+	if err = s.bes.Start(context.Background()); err != nil {
+		log.Errorf("error in BES stream start: %v", err)
+		return err
+	}
+	color.NoColor = false
+	s.besProgressTicker = time.NewTicker(2 * time.Second)
+	s.besProgressDone = make(chan bool)
+	go func() {
+		s.bes.SendConsole("\n\n\n\n\n\n", "")
+		for {
+			select {
+			case <-s.besProgressDone:
+				// Send last update.
+				s.bes.SendConsole(s.getHumanReadableProxyStatus(), "")
+				return
+			case <-s.besProgressTicker.C:
+				s.bes.SendConsole(s.getHumanReadableProxyStatus(), "")
+			}
+		}
+	}()
+	return nil
+}
+
+func (s *Server) getHumanReadableProxyStatus() string {
+	resp, err := s.Logger.GetStatusSummary(context.Background(), nil)
+	summary := &reproxystatus.Summary{
+		Addr: s.Address,
+		Err:  err,
+		Resp: resp,
+	}
+	prefix := client.ReplaceLine + client.ReplaceLine
+	prefix += prefix + client.ReplaceLine
+	return prefix + summary.HumanReadable() + "\n\n"
+}
+
+func (s *Server) maybeFinishBuildBES() (err error) {
+	if s.bes == nil {
+		return nil
+	}
+	failed, e := s.shouldFailBuild()
+	status := &client.BuildStatus{
+		Result: client.CommandSucceededBuildResult,
+	}
+	if failed {
+		status.Result = client.CommandFailedBuildResult
+		status.ExitCode = 1
+		status.Error = e
+	}
+	s.besProgressTicker.Stop()
+	s.besProgressDone <- true
+	if err := s.bes.Finish(context.Background(), status); err != nil {
+		log.Errorf("error in BES stream finish: %v", err)
+		return err
+	}
+	return nil
 }
 
 // SetStartupErr saves the first error that happens during async startup and then unblocks startup.
@@ -335,10 +443,6 @@ func (s *Server) DrainAndReleaseResources() {
 		}
 		close(s.drain)
 		s.wgShutdown.Wait()
-		if s.Logger != nil {
-			s.Logger.AddEventTimeToProxyInfo(event.ProxyUptime, s.StartTime, time.Now())
-		}
-		s.stats = s.Logger.CloseAndAggregate()
 		go func() {
 			defer close(s.cleanupDone)
 			for _, cleanup := range s.cleanupFns {
@@ -353,8 +457,13 @@ func (s *Server) DrainAndReleaseResources() {
 // Shutdown shuts the server down gracefully.
 func (s *Server) Shutdown(ctx context.Context, req *ppb.ShutdownRequest) (*ppb.ShutdownResponse, error) {
 	s.shutdownOnce.Do(func() {
+		if s.Logger != nil {
+			s.Logger.AddEventTimeToProxyInfo(event.ProxyUptime, s.StartTime, time.Now())
+		}
+		s.stats = s.Logger.CloseAndAggregate()
+		s.maybeFinishBuildBES()
 		close(s.shutdownCmd)
-		// Ensure DrainAndReleaseResources has been called to guarentee that s.stats is populated.
+		// Ensure DrainAndReleaseResources has been called to guarantee that s.stats is populated.
 		s.DrainAndReleaseResources()
 	})
 	return &ppb.ShutdownResponse{
@@ -414,6 +523,9 @@ func (s *Server) RunCommand(ctx context.Context, req *ppb.RunRequest) (*ppb.RunR
 	}
 	if cmd.Identifiers.InvocationID == "" {
 		cmd.Identifiers.InvocationID = invocationID
+	}
+	if cmd.Identifiers.CorrelatedInvocationID == "" {
+		cmd.Identifiers.CorrelatedInvocationID = buildID
 	}
 	cmd.FillDefaultFieldValues()
 	s.addLabelDigestToCommandID(cmd, req)
@@ -494,13 +606,23 @@ func (s *Server) RunCommand(ctx context.Context, req *ppb.RunRequest) (*ppb.RunR
 		a.rOpt.AcceptCached = false
 	}
 
+	if s.bes != nil {
+		if err := s.bes.CommandStarted(cmd); err != nil {
+			log.Errorf("error in BES command start: %v", err)
+		}
+	}
 	s.runAction(aCtx, a)
+	if s.bes != nil {
+		if err := s.bes.CommandFinished(cmd, a.res, a.execContext.Metadata); err != nil {
+			log.Errorf("error in BES command finish: %v", err)
+		}
+	}
 	if a.compare {
 		s.rerunAction(aCtx, a)
 	}
 
 	s.logRecord(a, start)
-	oe := a.oe.(*outerr.RecordingOutErr)
+	oe := a.oe
 	var logRecord *lpb.LogRecord
 	if req.GetExecutionOptions().GetIncludeActionLog() {
 		logRecord = a.rec.LogRecord
@@ -665,9 +787,8 @@ func (s *Server) runAction(ctx context.Context, a *action) {
 	case ppb.ExecutionStrategy_REMOTE_LOCAL_FALLBACK:
 		s.runRemote(ctx, a)
 		if !a.res.IsOk() {
-			roe := a.oe.(*outerr.RecordingOutErr)
 			log.Warningf("%v: Remote execution failed with %+v, falling back to local.\n stdout: %s\n stderr: %s",
-				a.cmd.Identifiers.ExecutionID, a.res, roe.Stdout(), roe.Stderr())
+				a.cmd.Identifiers.ExecutionID, a.res, a.oe.Stdout(), a.oe.Stderr())
 			a.oe = outerr.NewRecordingOutErr()
 			a.runLocal(ctx, s.LocalPool)
 			s.numFallbacks.Add(1)
@@ -832,9 +953,8 @@ func (s *Server) runRacing(ctx context.Context, a *action) {
 	if a.res == nil {
 		a.res = command.NewLocalErrorResult(fmt.Errorf("racing did not produce a result"))
 	}
-	if _, ok := a.oe.(*outerr.RecordingOutErr); !ok {
+	if a.oe == nil {
 		log.Warningf("%v: Racing produced a nil OutErr.", a.cmd.Identifiers.ExecutionID)
-		a.oe = outerr.NewRecordingOutErr()
 	}
 }
 
